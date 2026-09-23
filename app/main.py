@@ -11,11 +11,13 @@ from .analyzer import analyze
 from .comparison import build_comparison
 from .fixer import build_fix_preview
 from .gate import GateRequestError, compile_gate_request, evaluate_gate
+from .mover import build_move_preview
 from .refpath import shortest_reference_path
 from .sarif import build_sarif
 from .schemas import (
     GateRequest,
     ImportRequest,
+    MovePreviewRequest,
     ValidationCompareRequest,
     ValidationRequest,
     gate_payload,
@@ -89,6 +91,34 @@ def get_document(import_id: str, path: str) -> dict:
     if content is None:
         raise HTTPException(status_code=404, detail="document not found")
     return {"path": path, "content": content}
+
+
+@app.post("/api/imports/{import_id}/move-preview")
+def move_preview(import_id: str, req: MovePreviewRequest) -> dict:
+    """Preview the link rewrites caused by moving one document. Read-only."""
+    if not db.get_import(import_id):
+        raise HTTPException(status_code=404, detail="import not found")
+    try:
+        source = normalize_doc_path(req.source)
+        target = normalize_doc_path(req.target)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    documents = db.get_documents(import_id)
+    if source not in documents:
+        raise HTTPException(
+            status_code=404, detail=f"source document not found: {source!r}"
+        )
+    if target == source:
+        raise HTTPException(
+            status_code=409,
+            detail=f"target path is the source path: {target!r}",
+        )
+    if target in documents:
+        raise HTTPException(
+            status_code=409, detail=f"target path already occupied: {target!r}"
+        )
+    preview = build_move_preview(documents, source, target)
+    return {"import_id": import_id, **preview}
 
 
 # --------------------------------------------------------- reference path ---

@@ -52,6 +52,9 @@ class ParsedDoc:
     newline: str
     headings: list[Heading] = field(default_factory=list)
     links: list[Link] = field(default_factory=list)
+    # every reference-style definition on disk (including never-referenced
+    # ones); ``links`` only receives definitions that are actually used
+    ref_definitions: list[Link] = field(default_factory=list)
     code_lines: set[int] = field(default_factory=set)
 
 
@@ -175,7 +178,9 @@ def parse_markdown(path: str, content: str) -> ParsedDoc:
         if dm:
             s, e, raw = _strip_angles(dm.group(2), dm.start(2))
             label = _norm_label(dm.group(1))
-            ref_defs[label] = Link(lineno, s, e, raw, "definition", label)
+            definition = Link(lineno, s, e, raw, "definition", label)
+            ref_defs[label] = definition
+            doc.ref_definitions.append(definition)
 
         for lm in INLINE_LINK_RE.finditer(masked):
             s, e, raw = _strip_angles(lm.group(2), lm.start(2))

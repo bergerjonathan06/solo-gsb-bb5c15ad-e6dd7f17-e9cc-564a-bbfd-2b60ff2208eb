@@ -25,6 +25,11 @@ Markdown 文档，服务解析相对链接、标题锚点与代码块，建立�
   最短链时按路径序列字典序选定唯一结果，引用环路不会导致查询不终止，目标不可达
   时返回明确的空结果。查询与校验共用同一份解析与相对链接解析规则，只读、不产生
   诊断。
+- **文档移动预览**：模拟将某篇文档移动到新路径（
+  `POST /api/imports/{import_id}/move-preview`），重写所有受影响的内部链接——
+  指向被移动文档的链接跟随到新路径，被移动文档自身的出站相对链接按新目录重算，
+  保证每条链接解析后仍指向原来的文档；保留 fragment、标题、尖括号与图片/引用式
+  链接形式，跳过代码块、行内代码与外部链接。接口只读，不写数据库。
 - **结果对比**：对两次 `done` 状态的校验，按稳定指纹（`type`、`severity`、
   `path`、`line`、`message`、`details`）计算新增 / 移除 / 未变化诊断，并报告
   两次导入之间文档的新增、删除与内容变化路径（`POST /api/validations/compare`）。
@@ -94,6 +99,7 @@ pytest
 | `POST` | `/api/imports` | 导入文档集合 → `import_id` |
 | `GET` | `/api/imports/{import_id}` | 查看导入批次与文档路径 |
 | `GET` | `/api/imports/{import_id}/documents/{path}` | 读取单个文档 |
+| `POST` | `/api/imports/{import_id}/move-preview` | 文档移动预览：重写指向源文档与源文档出站的内部链接（不落库） |
 | `GET` | `/api/imports/{import_id}/reference-path` | 查询两篇文档间的最短引用链（`?from=`、`?to=`） |
 | `POST` | `/api/validations` | 对某导入批次发起校验（后台任务）→ `validation_id` |
 | `GET` | `/api/validations` | 最近校验任务列表 |
@@ -147,6 +153,11 @@ curl -X POST localhost:8000/api/validations/<validation_id>/gate \
 curl 'localhost:8000/api/imports/<import_id>/reference-path?from=README.md&to=docs/setup.md'
 # => {"import_id": "...", "from": "README.md", "to": "docs/setup.md",
 #     "found": true, "hops": 1, "path": ["README.md", "docs/setup.md"]}
+
+# 9. 文档移动预览（只读；把 docs/setup.md 移到 manual/setup.md）
+curl -X POST localhost:8000/api/imports/<import_id>/move-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"source": "docs/setup.md", "target": "manual/setup.md"}'
 ```
 
 修复预览响应：
@@ -204,6 +215,81 @@ curl 'localhost:8000/api/imports/<import_id>/reference-path?from=README.md&to=do
 错误码：导入批次不存在返回 `404`（`import not found`）；起点或目标文档不在
 批次中返回 `404`（`document not found: '<path>'`）；路径非法（绝对路径、
 `..` 逃逸、空路径）或缺少查询参数返回 `422`。
+
+## 文档移动预览
+
+`POST /api/imports/{import_id}/move-preview` 模拟将一篇文档从源路径移动到
+目标路径，预览由此引发的全部内部链接重写。请求与响应均不修改任何数据：
+源文档仍留在原路径，重复调用结果一致。
+
+请求体两个必填字段，均按导入相同的规则规范化（`./`、`../` 折叠等）：
+
+```json
+{"source": "docs/setup.md", "target": "manual/setup.md"}
+```
+
+重写只触及链接目的地（link destination），遵循两类规则：
+
+- **链接跟随（`link-follow`）**：批次内每篇文档（含被移动文档自身）中，凡是
+  解析后指向源文档的内部链接，目的地改写为指向目标路径——引用跟随文档移动。
+  相对链接按链接所在目录计算到目标路径的最短相对路径；以 `/` 开头的仓库根
+  绝对链接改写为新的根绝对路径（如 `/docs/setup.md` → `/manual/setup.md`）。
+- **出站相对链接重算（`link-relative`）**：仅作用于被移动文档自身。因其所在
+  目录发生变化，它包含的每条相对链接都按新目录重新表达，使链接解析后仍指向
+  移动前的同一文档（原本是断链的链接仍解析到同一路径）。指向自身的链接按
+  `link-follow` 跟随到目标路径；纯 fragment 页内链接与根绝对链接不受目录变化
+  影响，外部链接跳过。
+
+保留与跳过规则与校验/修复预览完全一致：
+
+- 原样保留 `#fragment`、链接标题（`"title"`）、尖括号目的地（`<…>`）、
+  图片（`![alt](…)`）与引用式链接（`[label]: target`，含从未被引用的定义；
+  引用用法行 `[x][label]` 本身不含目的地，不改写）；
+- 跳过围栏/缩进代码块、行内代码与外部链接（`http:`、`//host` 等）；
+- 非尖括号目的地中的空格按 `%20` 百分号编码，其余 Unicode 字符保持可读。
+
+响应中 `documents` 按路径排序（被移动文档以**新路径**为键，即使它自身没有
+任何链接需要改动也会出现）；每个文档的 `changes` 按行号升序，给出每行
+`before` / `after`，`new_content` 为完整新内容（保留原换行风格，CRLF 亦然）：
+
+```json
+{
+  "import_id": "…",
+  "source": "docs/setup.md",
+  "target": "manual/setup.md",
+  "documents": [
+    {
+      "path": "README.md",
+      "changes": [
+        {"line": 3, "kind": "link-follow",
+         "before": "参见 [安装](docs/setup.md#安装)。",
+         "after": "参见 [安装](manual/setup.md#安装)。"}
+      ],
+      "new_content": "# 项目\n\n参见 [安装](manual/setup.md#安装)。\n"
+    },
+    {
+      "path": "manual/setup.md",
+      "changes": [
+        {"line": 5, "kind": "link-relative",
+         "before": "参见 [步骤](intro.md#步骤)。",
+         "after": "参见 [步骤](../docs/intro.md#步骤)。"}
+      ],
+      "new_content": "# 安装\n\n参见 [步骤](../docs/intro.md#步骤)。\n"
+    }
+  ],
+  "stats": {"documents_changed": 2, "edits": 2}
+}
+```
+
+`stats.edits` 为实际发生的链接目的地改写次数（逐行文本无变化的不计数）；
+`kind` 在同行同时出现两种重写时以 `link-follow+link-relative` 表示。
+
+错误码：导入批次不存在返回 `404`（`import not found`）；规范化后的源路径不在
+批次中返回 `404`（`source document not found: '<path>'`）；目标路径已被其他
+文档占用、或目标与源为同一路径返回 `409`（
+`target path already occupied: '<path>'` /
+`target path is the source path: '<path>'`）；路径非法（绝对路径、`..` 逃逸、
+空路径）、缺少字段或携带多余字段返回 `422`。
 
 ## 校验结果对比
 
@@ -400,6 +486,7 @@ app/
   refpath.py   # 引用链查询：引用图上的最短链（字典序决胜、环路安全）
   comparison.py# 两次校验结果对比：诊断指纹差分 + 文档集合差分
   fixer.py     # 修复预览：最小化重写锚点与引用
+  mover.py     # 文档移动预览：入站链接跟随 + 出站相对链接重算
   sarif.py     # SARIF 2.1.0 导出：诊断 -> runs/results 映射
   gate.py      # 质量门禁：glob/正则忽略规则 + 阈值裁决
   db.py        # SQLite 持久层（imports / documents / validations / diagnostics）

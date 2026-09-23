@@ -23,6 +23,13 @@ class ValidationRequest(BaseModel):
     import_id: str
 
 
+class MovePreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: str = Field(min_length=1, max_length=1024)
+    target: str = Field(min_length=1, max_length=1024)
+
+
 class ValidationCompareRequest(BaseModel):
     base_validation_id: str = Field(min_length=1, max_length=64)
     target_validation_id: str = Field(min_length=1, max_length=64)
