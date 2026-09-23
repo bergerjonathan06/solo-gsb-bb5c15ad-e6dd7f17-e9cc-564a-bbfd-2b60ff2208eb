@@ -28,6 +28,11 @@ class ValidationCompareRequest(BaseModel):
     target_validation_id: str = Field(min_length=1, max_length=64)
 
 
+class MovePreviewRequest(BaseModel):
+    source: str = Field(min_length=1, max_length=1024)
+    destination: str = Field(min_length=1, max_length=1024)
+
+
 class SeverityThresholds(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

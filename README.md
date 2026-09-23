@@ -36,6 +36,12 @@ Markdown 文档，服务解析相对链接、标题锚点与代码块，建立�
   - 断锚 → 以最相似的目标锚点重写引用片段（相似度阈值 0.6）；
   - 断链 → 若集合中存在唯一同名文件，重写为正确的相对路径；
   - 循环引用 → 结构性问题，不自动修复，列入 `unfixed`。
+- **移动预览**：给定源路径与目标路径，预览移动一篇文档所需的全部链接改写
+  （`POST /api/imports/{import_id}/move-preview`）。所有指向源文档的内部链接
+  改指目标；被移动文档因所在目录变化，其出站相对链接按新目录重算，保证每条
+  链接解析后仍指向原文档。fragment、title、尖括号、图片/引用式链接形式一律保留，
+  代码块、行内代码与外部链接跳过；响应只含按路径排序的逐行变更与完整新内容，
+  **不写数据库**。
 
 ## 快速开始
 
@@ -95,6 +101,7 @@ pytest
 | `GET` | `/api/imports/{import_id}` | 查看导入批次与文档路径 |
 | `GET` | `/api/imports/{import_id}/documents/{path}` | 读取单个文档 |
 | `GET` | `/api/imports/{import_id}/reference-path` | 查询两篇文档间的最短引用链（`?from=`、`?to=`） |
+| `POST` | `/api/imports/{import_id}/move-preview` | 文档移动链接改写预览（不写数据库） |
 | `POST` | `/api/validations` | 对某导入批次发起校验（后台任务）→ `validation_id` |
 | `GET` | `/api/validations` | 最近校验任务列表 |
 | `GET` | `/api/validations/{validation_id}` | 任务状态 + 诊断（`?type=`、`?path=` 过滤） |
@@ -147,6 +154,11 @@ curl -X POST localhost:8000/api/validations/<validation_id>/gate \
 curl 'localhost:8000/api/imports/<import_id>/reference-path?from=README.md&to=docs/setup.md'
 # => {"import_id": "...", "from": "README.md", "to": "docs/setup.md",
 #     "found": true, "hops": 1, "path": ["README.md", "docs/setup.md"]}
+
+# 9. 移动预览：docs/setup.md -> guide/install.md（不落库）
+curl -X POST localhost:8000/api/imports/<import_id>/move-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"source": "docs/setup.md", "destination": "guide/install.md"}'
 ```
 
 修复预览响应：
@@ -204,6 +216,95 @@ curl 'localhost:8000/api/imports/<import_id>/reference-path?from=README.md&to=do
 错误码：导入批次不存在返回 `404`（`import not found`）；起点或目标文档不在
 批次中返回 `404`（`document not found: '<path>'`）；路径非法（绝对路径、
 `..` 逃逸、空路径）或缺少查询参数返回 `422`。
+
+## 文档移动预览
+
+`POST /api/imports/{import_id}/move-preview` 预览把一篇文档从源路径移动到
+目标路径所需的全部链接改写。接口只读：**不移动文档、不修改任何存储内容**，
+同一请求重复调用结果一致。请求体：
+
+```json
+{"source": "docs/setup.md", "destination": "guide/install.md"}
+```
+
+`source` 与 `destination` 均按与导入相同的规则规范化（反斜杠转正斜杠、
+`./` 与 `../` 折叠、拒绝绝对路径与根逃逸）。规范化后：源文档不存在返回
+`404`（`source document not found: '<path>'`）；目标路径已被其他文档占用
+返回 `409`（`destination already occupied: '<path>'`）；源与目标归一为同
+一路径返回 `422`。
+
+改写分两类，保证每条链接在移动后解析到的仍是同一篇文档：
+
+1. **入站链接**：其余文档中所有解析到源文档的内部链接改指目标文档；
+2. **出站链接**：被移动文档内每条带路径的内部相对链接（含图片、引用式
+   定义、自引用）都以新目录为基准重算；以 `/` 开头的仓库根相对链接保留
+   根相对形式，仅更新其指向的路径。
+
+改写只触及链接目的地，其余内容字节级保留：
+
+- `#fragment` 原样保留（包括空片段），标题（`"title"`）留在目的地之后不动；
+- 尖括号形式 `<...>` 保留（括号内空格仍按字面量处理），非尖括号目的地中的
+  空格继续以 `%20` 编码；
+- 行内、图片（`![...](...)`）与引用式（`[label]: target` + `[x][label]`）
+  的链接形式保留，仅替换定义中的目的地；
+- 围栏/缩进代码块、行内代码中的链接跳过；外部链接（`http:` 等）与仅含
+  `#fragment` 的页内链接跳过（页内链接与文档所在目录无关）；
+- 未被任何 `[x][label]` 引用的 reference 定义不参与（与校验的图规则一致）；
+- 原始换行（含 CRLF）保留。
+
+响应中 `documents` 按移动后的路径排序，每个元素给出该文档移动后的路径、
+`moved` 标记（被移动文档为 `true`，其 `path` 为目标路径）、按行号升序的
+逐行变更（`kind` 恒为 `link-target`）以及完整新内容 `new_content`。被移动
+文档即使自身无链接需要改写也会出现（其路径已变化）；无任何改动的其他文档
+不出现。
+
+```json
+{
+  "import_id": "…",
+  "source": "docs/setup.md",
+  "destination": "guide/install.md",
+  "documents": [
+    {
+      "path": "README.md",
+      "moved": false,
+      "changes": [
+        {"line": 3, "kind": "link-target",
+         "before": "参见 [安装](docs/setup.md#安装)。",
+         "after": "参见 [安装](guide/install.md#安装)。"}
+      ],
+      "new_content": "# 项目\n\n参见 [安装](guide/install.md#安装)。\n"
+    },
+    {
+      "path": "docs/api.md",
+      "moved": false,
+      "changes": [
+        {"line": 3, "kind": "link-target",
+         "before": "[安装](setup.md)",
+         "after": "[安装](../guide/install.md)"}
+      ],
+      "new_content": "# API\n\n[安装](../guide/install.md)\n"
+    },
+    {
+      "path": "guide/install.md",
+      "moved": true,
+      "changes": [
+        {"line": 5, "kind": "link-target",
+         "before": "参见 [API](api.md)，回到 [首页](../README.md)。",
+         "after": "参见 [API](../docs/api.md)，回到 [首页](../README.md)。"}
+      ],
+      "new_content": "# 安装\n\n## 步骤\n\n参见 [API](../docs/api.md)，回到 [首页](../README.md)。\n"
+    }
+  ],
+  "stats": {"documents_changed": 3, "links_rewritten": 3}
+}
+```
+
+上例中被移动文档回到根目录的 `../README.md` 因 `docs/` 与 `guide/` 深度
+相同而无需变化；指向同目录 `api.md` 的链接则改为 `../docs/api.md`。移入
+更深或更浅目录时，其全部出站相对链接都会相应重算。
+
+错误码：导入批次不存在返回 `404`（`import not found`）；请求体缺字段、
+空字符串等结构错误返回 `422`。
 
 ## 校验结果对比
 
@@ -400,6 +501,7 @@ app/
   refpath.py   # 引用链查询：引用图上的最短链（字典序决胜、环路安全）
   comparison.py# 两次校验结果对比：诊断指纹差分 + 文档集合差分
   fixer.py     # 修复预览：最小化重写锚点与引用
+  mover.py     # 文档移动预览：入站链接改指目标 + 出站链接按新目录重算
   sarif.py     # SARIF 2.1.0 导出：诊断 -> runs/results 映射
   gate.py      # 质量门禁：glob/正则忽略规则 + 阈值裁决
   db.py        # SQLite 持久层（imports / documents / validations / diagnostics）

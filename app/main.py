@@ -11,11 +11,13 @@ from .analyzer import analyze
 from .comparison import build_comparison
 from .fixer import build_fix_preview
 from .gate import GateRequestError, compile_gate_request, evaluate_gate
+from .mover import build_move_preview
 from .refpath import shortest_reference_path
 from .sarif import build_sarif
 from .schemas import (
     GateRequest,
     ImportRequest,
+    MovePreviewRequest,
     ValidationCompareRequest,
     ValidationRequest,
     gate_payload,
@@ -120,6 +122,39 @@ def reference_path(
         "hops": len(chain) - 1 if chain is not None else None,
         "path": chain if chain is not None else [],
     }
+
+
+# -------------------------------------------------------- document move ----
+
+@app.post("/api/imports/{import_id}/move-preview")
+def move_preview(import_id: str, req: MovePreviewRequest) -> dict:
+    """Preview the link rewrites implied by moving one document.
+
+    Read-only: returns per-line changes and full new contents without
+    touching stored documents.
+    """
+    if not db.get_import(import_id):
+        raise HTTPException(status_code=404, detail="import not found")
+    try:
+        src = normalize_doc_path(req.source)
+        dest = normalize_doc_path(req.destination)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    documents = db.get_documents(import_id)
+    if src not in documents:
+        raise HTTPException(
+            status_code=404, detail=f"source document not found: {src!r}"
+        )
+    if src == dest:
+        raise HTTPException(
+            status_code=422, detail=f"source and destination are the same path: {src!r}"
+        )
+    if dest in documents:
+        raise HTTPException(
+            status_code=409, detail=f"destination already occupied: {dest!r}"
+        )
+    preview = build_move_preview(documents, src, dest)
+    return {"import_id": import_id, **preview}
 
 
 # ------------------------------------------------------------ validations ---

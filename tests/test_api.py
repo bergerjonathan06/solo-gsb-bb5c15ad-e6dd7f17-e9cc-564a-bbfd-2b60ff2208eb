@@ -1253,3 +1253,281 @@ def test_reference_path_does_not_affect_validation(client):
     assert before == after
     assert body["summary"]["diagnostics"] == 8
 
+
+
+# ----------------------------------------------------------- move preview ----
+
+MOVE_CORPUS = {
+    "index.md": (
+        "# Home\n"
+        "\n"
+        "See the [guide](docs/guide.md#install).\n"
+        "\n"
+        "```\n"
+        "[fake](docs/guide.md)\n"
+        "```\n"
+        "\n"
+        "Inline `[x](docs/guide.md)` and [ext](https://example.com/docs/guide.md).\n"
+        "\n"
+        "Root [link](<docs/guide.md>).\n"
+    ),
+    "docs/guide.md": (
+        "# Guide\n"
+        "\n"
+        "## Install\n"
+        "\n"
+        "Back to [home](../index.md#home) and [api](api.md \"API title\").\n"
+        "\n"
+        "![diagram](diagram.png)\n"
+        "\n"
+        "[home-ref]: ../index.md\n"
+        "Follow [home][home-ref].\n"
+        "\n"
+        "Jump [here](#guide).\n"
+    ),
+    "docs/api.md": "# API\n\nSee the [guide](guide.md).\n",
+    "docs/diagram.png": "binary",
+}
+
+
+def move_preview(client, import_id, source, destination):
+    return client.post(
+        f"/api/imports/{import_id}/move-preview",
+        json={"source": source, "destination": destination},
+    )
+
+
+def test_move_preview_rewrites_inbound_and_outbound_links(client):
+    import_id = import_only(client, MOVE_CORPUS)
+    r = move_preview(client, import_id, "docs/guide.md", "docs/moved/guide.md")
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    assert body["import_id"] == import_id
+    assert body["source"] == "docs/guide.md"
+    assert body["destination"] == "docs/moved/guide.md"
+
+    docs = {d["path"]: d for d in body["documents"]}
+    # documents are sorted by their post-move path
+    assert [d["path"] for d in body["documents"]] == [
+        "docs/api.md",
+        "docs/moved/guide.md",
+        "index.md",
+    ]
+    assert body["stats"] == {"documents_changed": 3, "links_rewritten": 7}
+
+    moved = docs["docs/moved/guide.md"]
+    assert moved["moved"] is True
+    moved_after = moved["new_content"]
+    # outbound relative links re-based to the new directory; fragment kept
+    assert "Back to [home](../../index.md#home) and [api](../api.md \"API title\")." in moved_after
+    # image link re-based as well
+    assert "![diagram](../diagram.png)" in moved_after
+    # used reference-style definition re-based; usage form untouched
+    assert "[home-ref]: ../../index.md" in moved_after
+    assert "Follow [home][home-ref]." in moved_after
+    # fragment-only in-page link left alone
+    assert "Jump [here](#guide)." in moved_after
+
+    index_after = docs["index.md"]["new_content"]
+    assert "See the [guide](docs/moved/guide.md#install)." in index_after
+    assert "Root [link](<docs/moved/guide.md>)." in index_after
+    # fenced code block, inline code and external link untouched
+    assert "[fake](docs/guide.md)" in index_after
+    assert "`[x](docs/guide.md)`" in index_after
+    assert "https://example.com/docs/guide.md" in index_after
+
+    api_after = docs["docs/api.md"]["new_content"]
+    assert "See the [guide](moved/guide.md)." in api_after
+
+    # per-line changes: sorted by line, kind link-target, before != after
+    for doc in body["documents"]:
+        assert doc["changes"] == sorted(doc["changes"], key=lambda c: c["line"])
+        for change in doc["changes"]:
+            assert change["kind"] == "link-target"
+            assert change["before"] != change["after"]
+
+
+def test_move_preview_keeps_angle_bracket_form_with_spaces(client):
+    corpus = {
+        "a.md": "# A\n\n[file](<my docs/x.md>).\n",
+        "my docs/x.md": "# X\n\n[a](../a.md).\n",
+    }
+    import_id = import_only(client, corpus)
+    body = move_preview(client, import_id, "my docs/x.md", "deep/y.md").json()
+    docs = {d["path"]: d for d in body["documents"]}
+    # angle brackets retained, spaces stay literal inside them
+    assert "[file](<deep/y.md>)." in docs["a.md"]["new_content"]
+    # outbound link from the moved document
+    assert "[a](../a.md)." in docs["deep/y.md"]["new_content"]
+
+
+def test_move_preview_preserves_root_absolute_and_self_links(client):
+    corpus = {
+        "a.md": "# A\n\n[root](/sub/x.md#f) and [self](a.md#me).\n",
+        "sub/x.md": "# X\n\n[a](/a.md) and [me](x.md).\n",
+    }
+    import_id = import_only(client, corpus)
+    body = move_preview(client, import_id, "sub/x.md", "other/y.md").json()
+    docs = {d["path"]: d for d in body["documents"]}
+    # inbound root-absolute link points at the new root-relative location
+    assert "[root](/other/y.md#f)" in docs["a.md"]["new_content"]
+    # fragment-only self link is directory-independent and untouched
+    assert "[self](a.md#me)" in docs["a.md"]["new_content"]
+    # moved doc keeps root-absolute form for its own outbound links
+    assert "[a](/a.md)" in docs["other/y.md"]["new_content"]
+    # its relative self-link stays same-directory form (resolves to the moved doc)
+    assert "[me](y.md)" in docs["other/y.md"]["new_content"]
+
+
+def test_move_preview_link_resolution_is_invariant(client):
+    """Every rewritten link must resolve to the same document afterwards."""
+    from collections import Counter
+    from urllib.parse import unquote
+
+    from app.analyzer import is_external, resolve_target, split_fragment
+    from app.parser import parse_markdown
+
+    import_id = import_only(client, MOVE_CORPUS)
+    src, dest = "docs/guide.md", "docs/moved/guide.md"
+    body = move_preview(client, import_id, src, dest).json()
+
+    post = dict(MOVE_CORPUS)
+    del post[src]
+    for d in body["documents"]:
+        post[d["path"]] = d["new_content"]
+
+    def resolved(corpus):
+        out = Counter()
+        for owner, content in corpus.items():
+            for link in parse_markdown(owner, content).links:
+                target, frag, _ = split_fragment(link.raw_target)
+                if is_external(link.raw_target):
+                    out[(owner, None, None)] += 1
+                elif target == "":
+                    out[(owner, owner, frag)] += 1
+                else:
+                    out[(owner, resolve_target(owner, unquote(target)), frag)] += 1
+        return out
+
+    before = resolved(MOVE_CORPUS)
+    remapped = Counter()
+    for (owner, target, frag), n in before.items():
+        owner = dest if owner == src else owner
+        target = dest if target == src else target
+        remapped[(owner, target, frag)] += n
+    assert remapped == resolved(post)
+
+
+def test_move_preview_clean_corpus_stays_clean(client):
+    corpus = {
+        "README.md": "# Home\n\nSee [setup](docs/setup.md#install).\n",
+        "docs/setup.md": "# Setup\n\n## Install\n\nSee [api](api.md).\n",
+        "docs/api.md": "# API\n",
+    }
+    import_id = import_only(client, corpus)
+    body = move_preview(client, import_id, "docs/setup.md", "guide/start.md").json()
+    post = dict(corpus)
+    del post["docs/setup.md"]
+    for d in body["documents"]:
+        post[d["path"]] = d["new_content"]
+    assert not analyze(post).diagnostics
+
+
+def test_move_preview_rename_in_same_directory(client):
+    corpus = {
+        "dir/a.md": "# A\n\n[b](b.md)\n",
+        "dir/b.md": "# B\n\n[a](a.md#s)\n",
+    }
+    import_id = import_only(client, corpus)
+    body = move_preview(client, import_id, "dir/a.md", "dir/c.md").json()
+    docs = {d["path"]: d for d in body["documents"]}
+    # inbound link retargeted, fragment preserved
+    assert docs["dir/b.md"]["changes"][0]["after"] == "[a](c.md#s)"
+    # moved document is reported even though its own links need no rewrite
+    moved = docs["dir/c.md"]
+    assert moved["moved"] is True
+    assert moved["changes"] == []
+    assert moved["new_content"] == corpus["dir/a.md"]
+
+
+def test_move_preview_isolated_document_reports_only_moved_doc(client):
+    import_id = import_only(client, {"solo.md": "# Solo\n", "other.md": "# O\n"})
+    body = move_preview(client, import_id, "solo.md", "new/solo.md").json()
+    assert [d["path"] for d in body["documents"]] == ["new/solo.md"]
+    assert body["documents"][0]["changes"] == []
+    assert body["stats"] == {"documents_changed": 1, "links_rewritten": 0}
+
+
+def test_move_preview_crlf_preserved(client):
+    corpus = {"a.md": "# A\r\n\r\n[b](sub/b.md)\r\n", "sub/b.md": "# B\r\n"}
+    import_id = import_only(client, corpus)
+    body = move_preview(client, import_id, "sub/b.md", "sub2/b.md").json()
+    moved = [d for d in body["documents"] if d["moved"]][0]
+    assert "\r\n" in moved["new_content"]
+    assert "\n" not in moved["new_content"].replace("\r\n", "")
+
+
+def test_move_preview_normalizes_paths(client):
+    import_id = import_only(client, MOVE_CORPUS)
+    body = move_preview(
+        client, import_id, "./docs/guide.md", "docs/./moved/../moved/guide.md"
+    ).json()
+    assert body["source"] == "docs/guide.md"
+    assert body["destination"] == "docs/moved/guide.md"
+
+
+def test_move_preview_error_cases(client):
+    import_id = import_only(client, MOVE_CORPUS)
+
+    # unknown import
+    assert client.post(
+        "/api/imports/nope/move-preview",
+        json={"source": "a.md", "destination": "b.md"},
+    ).status_code == 404
+
+    # source missing
+    r = move_preview(client, import_id, "ghost.md", "x.md")
+    assert r.status_code == 404
+    assert "ghost.md" in r.json()["detail"]
+
+    # destination occupied
+    r = move_preview(client, import_id, "docs/guide.md", "docs/api.md")
+    assert r.status_code == 409
+    assert "docs/api.md" in r.json()["detail"]
+
+    # source and destination identical
+    assert move_preview(
+        client, import_id, "docs/guide.md", "docs/./guide.md"
+    ).status_code == 422
+
+    # invalid paths
+    assert move_preview(client, import_id, "/abs.md", "x.md").status_code == 422
+    assert move_preview(
+        client, import_id, "docs/guide.md", "../escape.md"
+    ).status_code == 422
+
+    # malformed bodies
+    assert client.post(
+        f"/api/imports/{import_id}/move-preview", json={"source": "a.md"}
+    ).status_code == 422
+    assert client.post(
+        f"/api/imports/{import_id}/move-preview", json={}
+    ).status_code == 422
+
+
+def test_move_preview_does_not_persist(client):
+    import_id = import_only(client, MOVE_CORPUS)
+    move_preview(client, import_id, "docs/guide.md", "docs/moved/guide.md")
+    # original documents still reachable, destination absent
+    assert (
+        client.get(f"/api/imports/{import_id}/documents/docs/guide.md").status_code
+        == 200
+    )
+    assert (
+        client.get(f"/api/imports/{import_id}/documents/docs/moved/guide.md").status_code
+        == 404
+    )
+    assert client.get(f"/api/imports/{import_id}").json()["paths"] == sorted(
+        MOVE_CORPUS
+    )
